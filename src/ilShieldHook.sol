@@ -70,6 +70,13 @@ abstract contract ILShieldHook is BaseHook {
         address indexed funder,
         uint256 amount
     );
+    event PositionRecorded(
+        PoolId indexed poolId,
+        address indexed lp,
+        uint160 sqrtPriceX96,
+        uint128 amt0,
+        uint128 amt1
+    );
 
     // =========================================================================
     //  CONSTRUCTOR
@@ -105,4 +112,59 @@ abstract contract ILShieldHook is BaseHook {
 
         emit ReserveFunded(pid, msg.sender, amount);
     }
+
+    function _afterAddLiquidity(
+        address,
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata,
+        BalanceDelta delta,
+        BalanceDelta,
+        bytes calldata hookData
+    ) internal override returns (bytes4, BalanceDelta) {
+        if (hookData.length == 0) {
+            return (
+                BaseHook.afterAddLiquidity.selector,
+                BalanceDeltaLibrary.ZERO_DELTA
+            );
+        }
+
+        address lp = abi.decode(hookData, (address));
+        PoolId pid = key.toId();
+
+        (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(pid);
+
+        uint128 amt0 = delta.amount0() > 0
+            ? uint128(uint256(int256(delta.amount0())))
+            : 0;
+        uint128 amt1 = delta.amount1() > 0
+            ? uint128(uint256(int256(delta.amount1())))
+            : 0;
+
+        // MVP : If LP already has a position, subtract its old insured value first 
+        if (positions[pid][lp].active) {
+            _subtractInsuredValue(pid, positions[pid][lp].entryAmount1);
+        }
+
+        positions[pid][lp] = LPPosition({
+            entrySqrtPriceX96: sqrtPriceX96,
+            entryAmount0: amt0,
+            entryAmount1: amt1,
+            entryTimestamp: block.timestamp,
+            active: true
+        });
+        totalInsuredValue[pid] += amt1;
+
+        emit PositionRecorded(pid, lp, sqrtPriceX96, amt0, amt1);
+
+        return (
+            BaseHook.afterAddLiquidity.selector,
+            BalanceDeltaLibrary.ZERO_DELTA
+        );
+    }
+
+    // =========================================================================
+    //  INTERNAL HELPERS
+    // =========================================================================
+
+    function _subtractInsuredValue(PoolId pid, uint128 amount) internal {}
 }
