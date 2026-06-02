@@ -1,183 +1,317 @@
-# Uniswap v4 Hook Template
+# ILShield Hook
 
-**A template for writing Uniswap v4 Hooks 🦄**
+> **A self-funded, on-chain mutual insurance system embedded directly in a Uniswap v4 pool.**
+> Every swap contributes a configurable premium to a shared reserve that compensates LPs for
+> impermanent loss when they exit — with tiered coverage, a deductible, a lock period,
+> and mathematically correct IL calculation for both full-range and concentrated positions.
 
-### Get Started
+Built for **UHI9 — The Yield-Protected AMM** Hookathon (April–June 2026).
 
-This template provides a starting point for writing Uniswap v4 Hooks, including a simple example and preconfigured test environment. Start by creating a new repository using the "Use this template" button at the top right of this page. Alternatively you can also click this link:
+---
 
-[![Use this Template](https://img.shields.io/badge/Use%20this%20Template-101010?style=for-the-badge&logo=github)](https://github.com/uniswapfoundation/v4-template/generate)
+## The Problem
 
-1. The example hook [Counter.sol](src/Counter.sol) demonstrates the `beforeSwap()` and `afterSwap()` hooks
-2. The test template [Counter.t.sol](test/Counter.t.sol) preconfigures the v4 pool manager, test tokens, and test liquidity.
+Impermanent loss is the single biggest reason sophisticated capital avoids providing AMM
+liquidity. Existing "solutions" (external insurance protocols, IL derivatives, yield farming
+subsidies) all share the same flaw: they live *outside* the pool. LPs must monitor, manually
+claim, approve separate contracts, and trust off-chain keepers. The feedback loop between
+trading activity and LP protection is entirely severed.
 
-<details>
-<summary>Updating to v4-template:latest</summary>
+## The Solution
 
-This template is actively maintained -- you can update the v4 dependencies, scripts, and helpers:
+ILShield embeds the entire insurance mechanism inside a Uniswap v4 hook. The pool itself
+becomes the insurer. The more the pool is used, the more the reserve grows. LPs opt into
+insurance by passing their address in `hookData` at deposit time — no external protocol,
+no separate claim transaction, no oracle dependency.
 
+```
+LP adds liquidity  →  hook records entry price, amounts, tick range
+Swaps happen       →  0.5% of each output goes to the insurance reserve  (Phase 2)
+LP removes liquidity →  hook calculates exact IL, checks gates, pays out automatically
+```
+
+---
+
+## Architecture
+
+### Phases
+
+| Phase | Status | Description |
+|-------|--------|-------------|
+| **Phase 1** | ✅ Implemented & tested | Manual reserve seeding via `fundReserve()`. All insurance logic, gates, and payouts fully functional. |
+| **Phase 2** | ✅ Implemented (afterSwap) | Automatic reserve collection: 0.5% of zeroForOne swap output is collected via `poolManager.take()` and credited to the reserve. |
+| **Phase 3** | 🔲 Future | Bidirectional collection — collect token0 premiums from oneForZero swaps and convert to token1 via router. |
+
+### Insurance Parameters (per pool, configurable by pool owner)
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `premiumBps` | 50 (0.5%) | Fraction of swap output reserved per swap |
+| `coveragePct` | 5000 (50%) | Fraction of computed IL that is paid out |
+| `deductibleBps` | 200 (2%) | Minimum IL before any payout is triggered |
+| `minLockSeconds` | 86400 (24h) | Minimum time between deposit and exit |
+
+---
+
+## How It Works
+
+### Position Recording (`afterAddLiquidity`)
+
+When an LP adds liquidity and passes their address in `hookData`, the hook records:
+- Entry pool price (`entrySqrtPriceX96`) — used as the IL baseline
+- Token amounts deposited (`entryAmount0`, `entryAmount1`)
+- Tick range (`tickLower`, `tickUpper`) — for accurate concentrated IL math
+- Liquidity units (`entryLiquidity`) — for proportional partial exits
+- Timestamp — for the lock period gate
+- Total insured value in token1 terms (`computeInsuredValue`)
+
+### Premium Collection (`afterSwap`)
+
+For every zeroForOne swap, the hook intercepts a fraction of the token1 output:
+
+```solidity
+// For a zeroForOne swap producing outputAmount of token1:
+uint256 premium = (outputAmount * premiumBps) / 10000;
+poolManager.take(key.currency1, address(this), premium);
+insuranceReserve[pid] += premium;
+return (selector, int128(int256(premium)));   // positive: hook takes from output
+```
+
+The `hookDeltaUnspecified` return reduces the swapper's effective output by `premium` and
+zeroes out the hook's delta with the PoolManager (verified against Uniswap v4 official docs).
+
+### IL Calculation (no external oracle)
+
+IL is computed from the pool's own `sqrtPrice` at entry vs exit, using the exact concentrated
+liquidity formula derived from Uniswap's liquidity equations:
+
+```
+Normalised by L/Q96 (Q96 = 2^96):
+
+V_hodl(s1) = (sb - s0) × s1² / (s0 × sb)  +  (s0 - sa)
+
+V_lp(s1):
+  in-range  (sa ≤ s1 ≤ sb) : 2·s1  − sa − s1²/sb
+  below sa                  : (sb − sa) × s1² / (sa × sb)
+  above sb                  : (sb − sa)
+
+ilBps = (1 − V_lp / V_hodl) × 10000
+```
+
+Where `sa` = `sqrtPriceAtTick(tickLower)`, `sb` = `sqrtPriceAtTick(tickUpper)`,
+`s0` = entry price, `s1` = current price (all X96 units).
+
+This formula **reduces exactly to the standard full-range formula** `1 − 2√k/(1+k)`
+when `tickLower = minUsableTick` and `tickUpper = maxUsableTick` (verified in tests).
+All multiplications use `FullMath.mulDiv` (512-bit intermediates, no overflow).
+
+### Payout Gates
+
+Three conditions must pass before any token1 is transferred to the LP:
+
+1. **Lock gate** — `block.timestamp ≥ entryTimestamp + minLockSeconds`
+2. **Deductible gate** — `ilBps > deductibleBps` (2% default)
+3. **Reserve gate** — `insuranceReserve[pid] > 0`
+
+### Payout Formula
+
+```
+fullIL       = propInsuredValue × ilBps / 10000
+covered      = fullIL × coveragePct / 10000
+proRataCap   = reserve × propInsuredValue / totalInsuredValue   ← prevents drain
+payout       = min(covered, proRataCap, reserve)
+```
+
+The **pro-rata cap** is the key fairness mechanism: no single LP can claim more than
+their proportional share of the reserve, regardless of exit order.
+
+### Partial Exits
+
+LPs can partially remove liquidity. The hook scales insurance proportionally:
+`propInsuredValue = fullInsuredValue × removedLiquidity / entryLiquidity`.
+The position remains active with reduced values; subsequent partial exits accumulate correctly.
+
+---
+
+## Contract Interface
+
+### Public Functions
+
+| Function | Who calls | Purpose |
+|----------|-----------|---------|
+| `initializePool(PoolKey)` | Pool creator | Registers pool and sets default insurance config |
+| `setPoolConfig(PoolKey, PoolConfig)` | Pool owner | Updates insurance parameters |
+| `fundReserve(PoolKey, amount)` | Anyone | Manually seeds the reserve (Phase 1 / top-up) |
+| `getPoolConfig(PoolId)` | Anyone | Returns full config struct |
+| `computeILBpsConcentrated(s0, s1, lo, hi)` | Anyone | Returns IL in basis points (concentrated formula) |
+| `computeILBps(s0, s1)` | Anyone | Returns IL in basis points (full-range formula, kept for compatibility) |
+| `computeInsuredValue(amt0, amt1, sqrt)` | Anyone | Returns portfolio value in token1 terms |
+
+### Hook Permissions
+
+```
+afterAddLiquidity         (1 << 10 = 0x0400)
+afterRemoveLiquidity      (1 << 8  = 0x0100)
+afterSwap                 (1 << 6  = 0x0040)
+afterSwapReturnDelta      (1 << 2  = 0x0004)
+Combined:                             0x0544
+```
+
+### Test Deployment Address Pattern
+
+```solidity
+address hookAddr = address(
+    uint160(
+        Hooks.AFTER_ADD_LIQUIDITY_FLAG   |
+        Hooks.AFTER_REMOVE_LIQUIDITY_FLAG |
+        Hooks.AFTER_SWAP_FLAG            |
+        Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+    ) ^ (0x4444 << 144)
+);
+```
+
+---
+
+## Test Coverage
+
+Run all tests:
 ```bash
-git remote add template https://github.com/uniswapfoundation/v4-template
-git fetch template
-git merge template/main <BRANCH> --allow-unrelated-histories
+forge test --match-contract ILShieldHookTest -vv
 ```
 
-</details>
+| # | Test | What it verifies |
+|---|------|-----------------|
+| 1 | `test_ILPayout_WhenPriceMoves` | Full lifecycle: position recorded → price moved 30 swaps → lock elapsed → payout issued → reserve decreased |
+| 2 | `test_NoPayout_WhenBelowDeductible` | No payout when IL < 2% deductible threshold |
+| 3 | `test_NoPayout_WhenLockNotMet` | No payout when exiting before 24h lock; position still cleared |
+| 4 | `test_ProRata_TwoLPs_FairSplit` | Two equal-size LPs receive equal payouts; combined payout ≤ reserve |
+| 5 | `test_ILMath_SpotChecks` | Full-range formula: k=1→0bps, k=2→572bps, k=4→2000bps, symmetric |
+| 6 | `test_FundReserve_AndGetConfig` | Manual reserve top-up; config getter returns correct struct |
+| 7 | `test_PartialRemoval_PositionUpdated` | Partial exit: position remains active with proportionally reduced values |
+| 8 | `test_ILMathConcentrated_FullRangeMatchesOriginal` | Concentrated formula = full-range formula for min/max ticks (within 5bps) |
+| 9 | `test_ILMathConcentrated_AboveRange` | Above-range IL is large (>50%) for a narrow 0.5x–2x range |
 
-### Requirements
+---
 
-This template is designed to work with Foundry (stable). If you are using Foundry Nightly, you may encounter compatibility issues. You can update your Foundry installation to the latest stable version by running:
+## Running the Project
 
+### Prerequisites
+```bash
+foundryup          # latest Foundry
 ```
-foundryup
-```
 
-To set up the project, run the following commands in your terminal to install dependencies and run the tests:
-
-```
+### Clone and install
+```bash
+git clone <your-repo>
+cd il-shield-hook
 forge install
-forge test
 ```
 
-### Local Development
-
-Other than writing unit tests (recommended!), you can only deploy & test hooks on [anvil](https://book.getfoundry.sh/anvil/) locally. Scripts are available in the `script/` directory, which can be used to deploy hooks, create pools, provide liquidity and swap tokens. The scripts support both local `anvil` environment as well as running them directly on a production network.
-
-### Executing locally with using **Anvil**:
-
-1. Start Anvil (or fork a specific chain using anvil):
-
+### Run tests
 ```bash
-anvil
+# All tests with logs
+forge test --match-contract ILShieldHookTest -vv
+
+# Verbose (full traces)
+forge test --match-contract ILShieldHookTest -vvvv
+
+# Single test
+forge test --match-test test_ILPayout_WhenPriceMoves -vv
 ```
 
-or
-
+### Build
 ```bash
-anvil --fork-url <YOUR_RPC_URL>
+forge build
 ```
 
-2. Execute scripts:
+---
 
-```bash
-forge script script/00_DeployHook.s.sol \
-    --rpc-url http://localhost:8545 \
-    --private-key <PRIVATE_KEY> \
-    --broadcast
-```
+## IL Math: Spot Check Reference
 
-### Using **RPC URLs** (actual transactions):
+| Scenario | k (price ratio) | IL (bps) | IL (%) |
+|----------|-----------------|----------|--------|
+| Unchanged | 1.0× | 0 | 0% |
+| Price +10% | 1.1× | ~23 | 0.23% |
+| Price doubles | 2.0× | 572 | 5.72% |
+| Price 4× | 4.0× | 2000 | 20.0% |
+| Price 10× | 10.0× | 4972 | 49.7% |
+| Price halved | 0.5× | 572 | 5.72% (symmetric) |
 
-:::info
-It is best to not store your private key even in .env or enter it directly in the command line. Instead use the `--account` flag to select your private key from your keystore.
-:::
+For a narrow concentrated position [0.5×, 2×] with price going to 3× (above range): IL ≈ 75.85%
 
-### Follow these steps if you have not stored your private key in the keystore:
+---
 
-<details>
+## Partner Integrations
 
-1. Add your private key to the keystore:
+No partner integrations. All IL math uses Uniswap v4 core libraries only (`TickMath`,
+`FullMath`, `StateLibrary`). The reserve is denominated in the pool's native `currency1` — no
+external price feed, no Chainlink, no TWAP oracle.
 
-```bash
-cast wallet import <SET_A_NAME_FOR_KEY> --interactive
-```
+---
 
-2. You will prompted to enter your private key and set a password, fill and press enter:
+## Known Limitations
 
-```
-Enter private key: <YOUR_PRIVATE_KEY>
-Enter keystore password: <SET_NEW_PASSWORD>
-```
+**hookData authorization (design tradeoff)**
+LP addresses are passed via `hookData` — the standard Uniswap v4 pattern for passing caller
+context through the PositionManager. The `require(!positions[pid][lp].active)` guard prevents
+position overwrite, but a 1-wei griefing tx can occupy an LP's slot. Production fix: track
+positions by `(poolId, tokenId)` instead of `(poolId, lpAddress)`.
 
-You should see this:
+**One-sided premium collection**
+Phase 2 only collects premiums from zeroForOne swaps (token1 output). OneForZero swaps
+generate token0 output, which would require on-chain conversion to token1. This is Phase 3.
 
-```
-`<YOUR_WALLET_PRIVATE_KEY_NAME>` keystore was saved successfully. Address: <YOUR_WALLET_ADDRESS>
-```
+**IL formula uses entry pool price, not position midpoint**
+`entrySqrtPriceX96` is the pool price at deposit time. For a concentrated position added
+at a price far from the tick range's geometric mean, the IL formula is a reasonable approximation
+but not exact. For full-range positions (the most common case), it is exact.
 
-::: warning
-Use `history -c` to clear your command history.
-:::
+**No payout for out-of-range entries**
+`computeILBpsConcentrated` returns 0 if `s0 <= sa || s0 >= sb` (LP entered out of range).
+A position entered entirely above or below the current price has no insurance coverage.
 
-</details>
+---
 
-1. Execute scripts:
+## Design Decisions
 
-```bash
-forge script script/00_DeployHook.s.sol \
-    --rpc-url <YOUR_RPC_URL> \
-    --account <YOUR_WALLET_PRIVATE_KEY_NAME> \
-    --sender <YOUR_WALLET_ADDRESS> \
-    --broadcast
-```
+**Why token1 as the reserve currency?**
+All payouts are in token1, which is the "quote" token in a Uniswap pair (e.g., USDC in
+ETH/USDC). This makes IL coverage predictable and denominated in the stable-er asset.
 
-You will prompted to enter your wallet password, fill and press enter:
+**Why `computeInsuredValue` uses both tokens?**
+The original design tracked only `entryAmount1` as the insured value. This undercounted
+by ignoring the token0 contribution. At price = 1:1, a 50/50 position has 2× the insured
+value of a token1-only position. The correct formula is `amt0 × price + amt1`.
 
-```
-Enter keystore password: <YOUR_PASSWORD>
-```
+**Why the pro-rata cap?**
+Without it, the first LP to exit during a large price crash drains the entire reserve.
+The cap ensures each LP's maximum claim is proportional to their share of total insured
+value at the time of exit.
 
-### Key Modifications to note:
+**Why gates before `_applyPositionUpdate`?**
+The Checks-Effects-Interactions pattern. Position state is cleared (or partially reduced)
+before any external ERC20 transfer, preventing reentrancy double-claims.
 
-1. Update the `token0` and `token1` addresses in the `BaseScript.sol` file to match the tokens you want to use in the network of your choice for sepolia and mainnet deployments.
-2. Update the `token0Amount` and `token1Amount` in the `CreatePoolAndAddLiquidity.s.sol` file to match the amount of tokens you want to provide liquidity with.
-3. Update the `token0Amount` and `token1Amount` in the `AddLiquidity.s.sol` file to match the amount of tokens you want to provide liquidity with.
-4. Update the `amountIn` and `amountOutMin` in the `Swap.s.sol` file to match the amount of tokens you want to swap.
+---
 
-### Verifying the hook contract
+## Future Work
 
-```bash
-forge verify-contract \
-  --rpc-url <URL> \
-  --chain <CHAIN_NAME_OR_ID> \
-  # Generally etherscan
-  --verifier <Verification_Provider> \
-  # Use --etherscan-api-key <ETHERSCAN_API_KEY> if you are using etherscan
-  --verifier-api-key <Verification_Provider_API_KEY> \
-  --constructor-args <ABI_ENCODED_ARGS> \
-  --num-of-optimizations <OPTIMIZER_RUNS> \
-  <Contract_Address> \
-  <path/to/Contract.sol:ContractName>
-  --watch
-```
+- **Phase 3**: Collect token0 premiums from oneForZero swaps, swap via in-pool routing
+- **Multi-position**: Track by `(poolId, tokenId)` to support multiple positions per LP address
+- **Dynamic premiums**: Adjust `premiumBps` based on pool volatility or utilisation
+- **Coverage tiers**: Multiple tiers with different lock/deductible/coverage parameters
+- **Cross-pool hedging**: Share reserve across correlated pairs (e.g., ETH/USDC + ETH/DAI)
+- **Governance**: Token-weighted voting on insurance parameters
 
-### Troubleshooting
+---
 
-<details>
+## Security Notes
 
-#### Permission Denied
+This contract is an MVP built for a hackathon. It has not been audited.
 
-When installing dependencies with `forge install`, Github may throw a `Permission Denied` error
-
-Typically caused by missing Github SSH keys, and can be resolved by following the steps [here](https://docs.github.com/en/github/authenticating-to-github/connecting-to-github-with-ssh)
-
-Or [adding the keys to your ssh-agent](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/generating-a-new-ssh-key-and-adding-it-to-the-ssh-agent#adding-your-ssh-key-to-the-ssh-agent), if you have already uploaded SSH keys
-
-#### Anvil fork test failures
-
-Some versions of Foundry may limit contract code size to ~25kb, which could prevent local tests to fail. You can resolve this by setting the `code-size-limit` flag
-
-```
-anvil --code-size-limit 40000
-```
-
-#### Hook deployment failures
-
-Hook deployment failures are caused by incorrect flags or incorrect salt mining
-
-1. Verify the flags are in agreement:
-   - `getHookCalls()` returns the correct flags
-   - `flags` provided to `HookMiner.find(...)`
-2. Verify salt mining is correct:
-   - In **forge test**: the _deployer_ for: `new Hook{salt: salt}(...)` and `HookMiner.find(deployer, ...)` are the same. This will be `address(this)`. If using `vm.prank`, the deployer will be the pranking address
-   - In **forge script**: the deployer must be the CREATE2 Proxy: `0x4e59b44847b379578588920cA78FbF26c0B4956C`
-     - If anvil does not have the CREATE2 deployer, your foundry may be out of date. You can update it with `foundryup`
-
-</details>
-
-### Additional Resources
-
-- [Uniswap v4 docs](https://docs.uniswap.org/contracts/v4/overview)
-- [v4-periphery](https://github.com/uniswap/v4-periphery)
-- [v4-core](https://github.com/uniswap/v4-core)
-- [v4-by-example](https://v4-by-example.org)
+Known attack vectors documented:
+- hookData DoS (see Known Limitations)
+- Reserve drainage via uncapped IL (mitigated by pro-rata cap)
+- Out-of-range entry (returns 0 IL, no payout)
+- Overflow in extreme price scenarios (FullMath protects most cases; theoretical overflow
+  at MAX_SQRT_PRICE with max uint128 amounts — not reachable in practice)
